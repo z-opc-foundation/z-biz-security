@@ -33,11 +33,19 @@ import java.util.UUID;
  *          └─▶ AUDIT────▶ 审计留痕（这次处理发生了什么）
  * </pre>
  *
- * <p><b>编排层不重复识别</b>：MASK 阶段内部会再跑一次识别（z-mask 的口径是
- * 「识别一次 → 脱敏一次」）。本层的 SENSE 阶段先跑是为了拿分级做<b>拦截判定</b>，
- * 两次识别的结果口径一致（同规则集）⇒ 拦截判定与脱敏结果不会打架。
- * 如果要严格做到「只识别一次」，需 z-mask 提供「按命中列表脱敏」的重载 ——
- * **M1 先按现状实现，接口已留**。
+ * <p><b>★ 编排层只识别一次（M2 落地）</b>：SENSE 阶段跑一次识别拿到分级做<b>拦截判定</b>，
+ * MASK 阶段把**同一份命中列表**交给 z-mask 的「按命中脱敏」重载 ⇒ **全文只扫一遍**。
+ *
+ * <p><b>为什么必须只识别一次</b>：M1 口径下 MASK 阶段会再跑一次识别，
+ * 看似「口径一致、无害」，实则有两个真问题：
+ * <ol>
+ *   <li><b>白扫两遍</b>：识别是全文 × 规则集线性扫描，规则集上量后是实打实的双倍开销；</li>
+ *   <li><b>★ 可能打架</b>：两次识别之间若规则集热更（识别实现被换），
+ *       拦截判定用的分级与脱敏用的分级可能来自**不同规则集**
+ *       ⇒ 「判了不拦，却按另一套规则脱了」⇒ 口径失真。</li>
+ * </ol>
+ * 改法：MASK 阶段走 {@code maskService.mask(text, senseResult)} 重载，
+ * **不重扫**。命中列表契约破坏（文本长度对不上）时 z-mask 会**退回自识别**兜底。
  *
  * <p><b>各段失败不拖垮整条链</b>：单段异常 ⇒ 该段降级（脱敏失败 ⇒ 原样返回；
  * 水印失败 ⇒ 不加水印；审计失败 ⇒ 忽略），但**拦截判定永远先做**——
@@ -129,10 +137,14 @@ public class SecurityPipeline {
         }
 
         // ---- 阶段 2：脱敏 ----
+        // ★ 复用 SENSE 阶段的命中列表（不重扫）⇒ 全文只识别一次。
+        //    SENSE 没跑 / 跑失败 ⇒ 退回自识别（此时没有可复用的命中）。
         int maskedCount = 0;
         if (policy.runs(SecurityStage.MASK)) {
             try {
-                MaskResult masked = maskService.mask(current);
+                MaskResult masked = (sense != null)
+                        ? maskService.mask(current, sense)
+                        : maskService.mask(current);
                 if (masked != null) {
                     current = masked.getMaskedText();
                     maskedCount = masked.getItems() == null ? 0 : masked.getItems().size();
