@@ -8,6 +8,44 @@
 --    ⇒ 会破坏幂等）。二级索引需求另开 _doc/002_deploy/init/00X_*.sql 并**只执行一次**。
 -- =====================================================================
 
+-- ===========================================================================
+-- ★ z_audit_event（审计事件台账）—— **本表不是本域的资产，是共用表**
+--
+-- 权威源：`z-audit/_doc/002_deploy/init.sql`。本文件里的这份定义**只是副本**，
+-- 给「编排层与审计域同进程部署」用 —— 两域共用一张 `z_audit_event`（共库 `oc`），
+-- 编排层跑完流水线要写两条留痕（水印溯源行 `WM:` + 处理审计行 `SEC:`），
+-- 没有这张表 ⇒ **打了水印却没留痕**（M2 #22 修掉的缺口）。
+--
+-- ⚠️ **只允许同进程部署时直写本表**：哈希链要求**单写者**（多写者各持链尾 ⇒ 链分叉）。
+--    编排层与 z-audit 分进程部署时，编排层**必须**改走 HTTP 交给 z-audit 写。
+--
+-- ⚠️ **两份定义必须一致**：改了 z-audit 那边的定义，这边要同步。
+--    对账脚本：`.workbuddy/check-audit-ddl-sync.py`（CI 里跑，不一致即判红）。
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS z_audit_event (
+    id            BIGINT       NOT NULL AUTO_INCREMENT,
+    event_id      VARCHAR(64)  NOT NULL,
+    trace_id      VARCHAR(64)  NULL,
+    operator_id   VARCHAR(64)  NULL,
+    operator_name VARCHAR(64)  NULL,
+    tenant_id     VARCHAR(64)  NULL,
+    action        VARCHAR(32)  NOT NULL,
+    result        VARCHAR(16)  NOT NULL,
+    target_type   VARCHAR(64)  NULL,
+    target_id     VARCHAR(128) NULL,
+    detail        VARCHAR(1024) NULL,
+    client_ip     VARCHAR(64)  NULL,
+    user_agent    VARCHAR(512) NULL,
+    occurred_at   BIGINT       NOT NULL,
+    prev_hash     VARCHAR(64)  NOT NULL,
+    hash          VARCHAR(64)  NOT NULL,
+    CONSTRAINT pk_z_audit_event PRIMARY KEY (id),
+    CONSTRAINT uk_z_audit_event_event_id UNIQUE (event_id)
+);
+
+-- 幂等键：event_id 唯一 ⇒ 同一追踪码的水印溯源行重放只留一条（不重复记账）。
+
+
 CREATE TABLE IF NOT EXISTS z_biz_security_policy (
     id                 BIGINT       NOT NULL AUTO_INCREMENT,
     policy_id          VARCHAR(64)  NOT NULL COMMENT '策略 ID（同一策略的多版本共享）',

@@ -14,8 +14,7 @@ import com.zifang.z.sense.core.domain.SensitiveLevel;
 import com.zifang.z.sense.core.service.SenseService;
 import com.zifang.z.watermark.core.domain.WatermarkPayload;
 import com.zifang.z.watermark.core.service.WatermarkService;
-
-import java.util.UUID;
+import com.zifang.z.watermark.core.support.WatermarkTraceIds;
 
 /**
  * 安全流水线 —— **编排层的核心**。
@@ -95,7 +94,14 @@ public class SecurityPipeline {
                               String operatorId) {
         long start = System.currentTimeMillis();
         SecurityResult result = new SecurityResult();
-        result.setTraceId(UUID.randomUUID().toString().replace("-", ""));
+
+        // ---- ★ 追踪码单一来源（M2 #22）----
+        // 追踪码必须在**任何阶段开始前**定下来，且**同一个值**贯穿：
+        //   流水线结果 traceId ≡ 水印载荷 traceId ≡ 审计事件 traceId。
+        // ⚠ 早先实现：流水线自己 `UUID.randomUUID()`，水印载荷用调用方给的 traceId
+        //    ⇒ 两个不同的值 ⇒ 拿水印里的码去反查审计台账**永远查不到**。
+        String traceId = resolveTraceId(payload);
+        result.setTraceId(traceId);
 
         if (text == null) {
             result.setContent("");
@@ -131,7 +137,7 @@ public class SecurityPipeline {
             result.setStatus(SecurityResult.STATUS_BLOCKED);
             result.setBlockReason("命中级别 " + sense.getMaxLevel().name()
                     + " ≥ 阈值 " + policy.getBlockThreshold() + "，已拦截");
-            audit(result, policy, operatorId, AuditResult.DENIED, "命中敏感数据被拦截");
+            audit(result, policy, operatorId, payload, AuditResult.DENIED, "命中敏感数据被拦截");
             result.setElapsedMillis(System.currentTimeMillis() - start);
             return result;
         }
@@ -159,29 +165,73 @@ public class SecurityPipeline {
         }
 
         // ---- 阶段 3：水印 ----
+        // ★ 用 embedTraced（不是 embed）：打水印的同时把溯源台账写出去，
+        //    且追踪码已由上面统一 ⇒ 水印里的码与台账里的码必然一致。
+        boolean watermarkApplied = false;
         if (policy.runs(SecurityStage.WATERMARK) && payload != null) {
             try {
-                Object watermarked = watermarkService.embed(policy.getWatermarkType(), current, payload);
-                if (watermarked != null) {
-                    current = String.valueOf(watermarked);
-                    result.setWatermarkPayload(payload);
+                WatermarkService.TracedWatermarkResult traced =
+                        watermarkService.embedTraced(policy.getWatermarkType(), current, payload);
+                if (traced != null && traced.getWatermarked() != null) {
+                    current = String.valueOf(traced.getWatermarked());
+                    result.setWatermarkPayload(traced.getPayload());
+                    watermarkApplied = true;
+                    if (!traced.isTraceRecorded()) {
+                        // ⚠ 台账没写成 ⇒ 这是**合规缺口**，必须让上层看见。
+                        //    静默吞掉 = 「打了水印但没留痕」被当成正常流程掩盖过去。
+                        result.setTraceError(traced.getTraceError());
+                    }
                 }
             } catch (RuntimeException e) {
                 // 水印失败 ⇒ 不加水印（内容仍可用）
+                result.setTraceError("水印失败：" + e.getMessage());
             }
         }
 
         result.setContent(current);
 
         // ---- 阶段 4：审计 ----
+        // ★ **不重复记账**：水印阶段（embedTraced）已经把「水印溯源」写进台账了
+        //    （eventId = WM:<traceId>）。这里只记**处理动作**这一条
+        //    （eventId = SEC:<traceId>）⇒ 两条记录各司其职，不撞同一行。
+        //    ⚠ 早先实现：这里只记一条且 action 取 WATERMARK/MASK，
+        //    与水印域记的那条语义重叠 ⇒ 要么重复、要么看不出「处理发生过」。
         if (policy.runs(SecurityStage.AUDIT)) {
-            audit(result, policy, operatorId,
+            audit(result, policy, operatorId, payload,
                     result.isBlocked() ? AuditResult.DENIED : AuditResult.SUCCESS,
-                    "处理完成，脱敏 " + maskedCount + " 处");
+                    "处理完成，脱敏 " + maskedCount + " 处"
+                            + (watermarkApplied ? "，已打水印" : ""));
         }
 
         result.setElapsedMillis(System.currentTimeMillis() - start);
         return result;
+    }
+
+    /**
+     * ★ 定追踪码（**单一来源**）。
+     *
+     * <p>口径：
+     * <ul>
+     *   <li>水印载荷给了追踪码 ⇒ 用它（调用方已有上下文，不要覆盖）；</li>
+     *   <li>载荷没给追踪码 ⇒ 生成一个**短码**（{@link WatermarkTraceIds}）。</li>
+     * </ul>
+     *
+     * <p><b>⚠ 为什么必须是短码</b>：盲水印的载体容量是硬约束 ——
+     * UUID 去横线 32 字符 ⇒ 需要约 141 个词间隔才装得下 ⇒
+     * 绝大多数正文根本打不上盲水印。短码 13 字符 ⇒ 约 65 词即可。
+     *
+     * @param payload 水印载荷（可空）
+     * @return 追踪码
+     */
+    private static String resolveTraceId(WatermarkPayload payload) {
+        if (payload != null && payload.getTraceId() != null && !payload.getTraceId().isEmpty()) {
+            return payload.getTraceId();
+        }
+        String traceId = WatermarkTraceIds.next();
+        if (payload != null) {
+            payload.setTraceId(traceId);
+        }
+        return traceId;
     }
 
     /**
@@ -214,26 +264,42 @@ public class SecurityPipeline {
     /**
      * 审计留痕（**失败不外抛**）。
      *
+     * <p><b>★ 不重复记账（M2 #22）</b>：本方法记的是「**这次安全处理发生过**」，
+     * eventId = {@code SEC:<traceId>}；
+     * 而水印阶段（{@code embedTraced}）记的是「**这份内容被打了水印**」，
+     * eventId = {@code WM:<traceId>}。
+     * 两个前缀 ⇒ 两行记录 ⇒ 既不重复，又能在台账里分别看到
+     * 「处理动作」与「水印溯源」两条线索。
+     *
      * @param result     结果
      * @param policy     策略
      * @param operatorId 操作人
+     * @param payload    水印载荷（取租户 / 单号；可空）
      * @param auditResult 结果
      * @param detail     说明
      */
     private void audit(SecurityResult result, SecurityPolicy policy, String operatorId,
-                       AuditResult auditResult, String detail) {
+                       WatermarkPayload payload, AuditResult auditResult, String detail) {
         if (auditService == null) {
             return;
         }
         try {
             AuditEvent event = new AuditEvent();
+            // ★ 幂等键：固定前缀 + 追踪码 ⇒ 同一 traceId 重放只留一条。
+            event.setEventId("SEC:" + result.getTraceId());
             event.setTraceId(result.getTraceId());
             event.setOperatorId(operatorId);
+            if (payload != null) {
+                event.setTenantId(payload.getTenantId());
+            }
+            // 动作：跑没跑水印 ⇒ WATERMARK / MASK（**口径不变**，只是补全了上下文）。
             event.setAction(policy.runs(SecurityStage.WATERMARK) ? AuditAction.WATERMARK : AuditAction.MASK);
             event.setResult(auditResult);
             event.setTargetType(policy.getScene());
-            event.setTargetId(policy.getPolicyId());
-            event.setDetail(detail);
+            // ★ targetId 存业务单号（不是 policyId）⇒ 溯源时能直接看到「哪份单子」。
+            //    policyId 挪到 detail 里，两者都要，不能二选一。
+            event.setTargetId(payload == null ? policy.getPolicyId() : payload.getBizNo());
+            event.setDetail(detail + "（策略 " + policy.getPolicyId() + "）");
             auditService.record(event);
         } catch (RuntimeException e) {
             // 审计失败不影响主链路

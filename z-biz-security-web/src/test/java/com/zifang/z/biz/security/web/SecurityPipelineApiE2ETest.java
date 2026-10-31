@@ -34,9 +34,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {
-                "z.base.db.biz-security.url=jdbc:h2:mem:zsec_e2e;MODE=MySQL;DB_CLOSE_DELAY=-1",
-                "z.base.db.biz-security.username=sa",
-                "z.base.db.biz-security.password="
+                "z.base.db.bizsecurity.url=jdbc:h2:mem:zsec_e2e;MODE=MySQL;DB_CLOSE_DELAY=-1",
+                "z.base.db.bizsecurity.username=sa",
+                "z.base.db.bizsecurity.password="
         })
 class SecurityPipelineApiE2ETest {
 

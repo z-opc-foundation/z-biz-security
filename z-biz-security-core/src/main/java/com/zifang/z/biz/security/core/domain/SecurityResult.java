@@ -45,6 +45,17 @@ public class SecurityResult {
     private long elapsedMillis;
     /** 追踪 ID（审计用）。 */
     private String traceId;
+    /**
+     * ★ 溯源台账错误（M2 #22）。
+     *
+     * <p><b>为什么要有这个字段</b>：水印打上了但**台账没写成** ⇒
+     * 这份内容「有水印、无留痕」⇒ 泄密后拿水印里的追踪码**查不到任何东西**
+     * ⇒ 这是**合规缺口**，不是正常流程。
+     *
+     * <p>⚠ 不能静默吞掉：缺口必须能上报给调用方（否则合规告警永远不会响）。
+     * 注意它**不阻断主链路** —— 内容照常返回，只是把缺口标出来。
+     */
+    private String traceError;
 
     public String getContent() {
         return content;
@@ -118,6 +129,14 @@ public class SecurityResult {
         this.traceId = traceId;
     }
 
+    public String getTraceError() {
+        return traceError;
+    }
+
+    public void setTraceError(String traceError) {
+        this.traceError = traceError;
+    }
+
     /**
      * 是否被拦截。
      *
@@ -141,6 +160,7 @@ public class SecurityResult {
         view.put("maxLevel", maxLevel);
         view.put("blockReason", blockReason);
         view.put("elapsedMillis", elapsedMillis);
+        view.put("traceError", traceError);
         if (senseResult != null) {
             view.put("hitCount", senseResult.getHits() == null ? 0 : senseResult.getHits().size());
             view.put("categoryCounts", senseResult.getCategoryCounts());

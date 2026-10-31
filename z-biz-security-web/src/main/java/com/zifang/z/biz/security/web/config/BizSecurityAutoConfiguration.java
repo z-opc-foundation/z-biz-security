@@ -1,7 +1,11 @@
 package com.zifang.z.biz.security.web.config;
 
+import com.zifang.z.audit.core.mapper.AuditEventMapper;
 import com.zifang.z.audit.core.service.AuditService;
+import com.zifang.z.audit.core.service.AuditTraceService;
+import com.zifang.z.audit.core.service.PersistentAuditStore;
 import com.zifang.z.biz.security.core.mapper.SecurityPolicyMapper;
+import com.zifang.z.biz.security.core.service.LocalAuditTraceAdapter;
 import com.zifang.z.biz.security.core.service.PersistentPolicyStore;
 import com.zifang.z.biz.security.core.service.PolicyLedgerService;
 import com.zifang.z.biz.security.core.service.SecurityPipeline;
@@ -65,25 +69,76 @@ public class BizSecurityAutoConfiguration {
     }
 
     /**
-     * 水印服务。
+     * 水印服务（**挂上溯源台账出口** —— M2 #22）。
      *
+     * <p>⚠️ 早先实现是 {@code new WatermarkService()} —— **没挂任何溯源出口** ⇒
+     * {@code embedTraced} 每次都标一句「未配置溯源台账出口」，
+     * 而编排层的 AUDIT 阶段又只写 {@code SEC:} 处理行 ⇒
+     * <b>「水印溯源行」永远缺位</b> ⇒ 打了水印却没留痕，而且没人知道。
+     *
+     * <p>修法：把 {@link LocalAuditTraceAdapter} 挂到 recorder + query 上 ⇒
+     * 水印行（{@code WM:}）与处理行（{@code SEC:}）走**同一个** {@link AuditService}
+     * ⇒ 共享同一条哈希链的链尾 ⇒ 链不分叉。
+     *
+     * @param auditService     审计门面
+     * @param auditTraceService 反查服务
      * @return 水印服务
      */
     @Bean
     @ConditionalOnMissingBean
-    public WatermarkService watermarkService() {
-        return new WatermarkService();
+    public WatermarkService watermarkService(AuditService auditService,
+                                             AuditTraceService auditTraceService) {
+        WatermarkService service = new WatermarkService();
+        LocalAuditTraceAdapter adapter = new LocalAuditTraceAdapter(auditService, auditTraceService);
+        service.setTraceRecorder(adapter);
+        service.setTraceQuery(adapter);
+        return service;
     }
 
     /**
-     * 审计服务（**无持久化** ⇒ 只算链不留库；宿主可换成落库版）。
+     * ★ 审计落库存储（M2 #22 —— 审计必须真的落库）。
      *
+     * <p><b>⚠️ 为什么编排层要挂落库 Sink</b>：早先实现是 {@code new AuditService()}
+     * —— **只算链不投递** ⇒ 编排层产生的安全事件**一条都没进台账**。
+     * 结果是：盲水印里明明有追踪码，但拿去反查台账**永远是空的** ⇒ 溯源闭环是断的。
+     *
+     * <p><b>⚠️ 单写者口径</b>：{@code z_audit_event} 表的唯一权威写者是 z-audit 服务。
+     * 本域直写同一张表适用于「编排层与审计域同进程部署」；
+     * 若两者分进程部署，本域必须改走 HTTP 交给 z-audit 写（否则两条链分叉）。
+     *
+     * @param mapper 审计事件 Mapper
+     * @return 落库存储
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public PersistentAuditStore persistentAuditStore(AuditEventMapper mapper) {
+        return new PersistentAuditStore(mapper);
+    }
+
+    /**
+     * 审计服务（**落库版** —— 事件真的进台账，且可按追踪码反查）。
+     *
+     * @param store 落库存储（兼查询出口）
      * @return 审计服务
      */
     @Bean
     @ConditionalOnMissingBean
-    public AuditService auditService() {
-        return new AuditService();
+    public AuditService auditService(PersistentAuditStore store) {
+        AuditService service = new AuditService(store);
+        service.setQuery(store);
+        return service;
+    }
+
+    /**
+     * ★ 溯源反查服务（M2 #22 —— 盲水印溯源的查询侧）。
+     *
+     * @param store 落库存储（兼查询出口）
+     * @return 反查服务
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public AuditTraceService auditTraceService(PersistentAuditStore store) {
+        return new AuditTraceService(store);
     }
 
     /**

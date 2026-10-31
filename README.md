@@ -37,7 +37,11 @@
 | 策略回滚（**以新版本号重发老内容**） | ✅ M2 | `service/PolicyLedgerService#rollback` |
 | 启动装载（台账为唯一权威源 + 首次播种） | ✅ M2 | `service/PolicyLedgerService#bootstrap` · `web/config/PolicyBootstrap` |
 | **识别一次脱敏一次**（按命中列表脱敏的重载） | ✅ M2 | MASK 阶段复用 SENSE 的命中列表（`maskService.mask(text, sense)`） |
-| 域内 DDL | — | M1 编排层**无自有表**（策略台账化时才需要） |
+| **★★ 溯源闭环**（追踪码单一来源 + WM/SEC 两条留痕 + 三态反查） | ✅ M2 #22 | `service/SecurityPipeline` · `service/LocalAuditTraceAdapter` |
+| **★ 追踪码单一来源**（结果 ≡ 载荷 ≡ 审计 ≡ 台账） | ✅ M2 #22 | `SecurityPipeline#resolveTraceId` |
+| **★ 不重复记账**（`WM:<traceId>` 水印行 + `SEC:<traceId>` 处理行） | ✅ M2 #22 | 两个幂等键各司其职，不撞同一行 |
+| **★ 审计真落库**（早先 `new AuditService()` 只算链） | ✅ M2 #22 | `web/config/BizSecurityAutoConfiguration` → `PersistentAuditStore` |
+| 域内 DDL | ✅ M2 | `_doc/002_deploy/init.sql`（`z_biz_security_policy` + `z_audit_event` **副本**） |
 
 ## 🔑 核心口径
 
@@ -161,6 +165,59 @@ MaskResult masked = (sense != null)
 > 「偷偷识别了第二次但结果碰巧相同」蒙混过去 ⇒ 数调用次数才是唯一可靠判据。
 > 已写进 `SecurityPipelineSingleSenseTest`（5 例）。
 
+### ★★ 溯源闭环：追踪码必须只有一个来源（M2 #22 落地）
+
+拿到泄密文件的人提取出盲水印里的**追踪码**，拿这个码反查台账，
+还原「谁在什么时候把哪份单号导出去的」。
+
+```
+流水线结果 traceId ≡ 水印载荷 traceId ≡ 审计事件 traceId ≡ 台账记录 traceId
+```
+
+> ⚠ **这条等式是 #22 的全部价值**：早先实现里流水线自己 `UUID.randomUUID()`、
+> 水印用调用方给的 `traceId` ⇒ **两个不同的值** ⇒
+> 拿水印里的码去反查审计台账**永远查不到** ⇒ 溯源闭环是断的。
+> 而且**从功能上完全看不出来** —— 打水印成功、审计也成功，只有反查时才暴露。
+>
+> ⇒ 追踪码必须在**任何阶段开始前**定下来（`SecurityPipeline#resolveTraceId`），
+> 且必须是**短码**（盲水印容量硬约束：UUID 32 字符需约 141 个词间隔 ⇒ 打不上）。
+
+#### 两条留痕，各司其职
+
+| 行 | 幂等键 | 内容 | 谁写 |
+|---|---|---|---|
+| **水印溯源行** | `WM:<traceId>` | 这份内容被打了水印：操作人 / 租户 / 单号 / 水印类型 | `LocalAuditTraceAdapter`（`embedTraced` 阶段） |
+| **处理审计行** | `SEC:<traceId>` | 这次安全处理发生过：脱敏几处 / 有没有被拦 / 用的哪个策略 | `SecurityPipeline#audit`（AUDIT 阶段） |
+
+> ⚠ **两个前缀 ⇒ 两行不撞同一行，也不丢任何线索**。
+> 早先只有一行且语义重叠 ⇒ 要么重复、要么看不出「处理发生过」。
+
+#### 三态反查（404 ≠ 503）
+
+| 情况 | HTTP | 含义 | 处置 |
+|---|---|---|---|
+| 查到 | **200** | — | 看 summary |
+| 台账里没有这条 | **404** | **合规缺口**（打过水印却没留痕，或记录被删） | **报警** |
+| 台账不可用 | **503** | **基础设施故障**（库连不上 / SQL 报错） | **修库** |
+
+> ⚠ 两者都返回「空列表」⇒ 运维会误判成「没发生过」⇒ **漏报合规缺口**。
+
+#### ⚠ 单写者口径与部署前提
+
+`z_audit_event` 的**唯一权威写者是 z-audit 服务**（哈希链要求单写者 ——
+多写者各持链尾 ⇒ 链分叉 ⇒ 校验必然报断）。
+
+**当前实现是「同进程直写」**：编排层与审计域同进程部署时，编排层通过
+`PersistentAuditStore` 直写同一张表，并在 `_doc/002_deploy/init.sql` 里
+带上 `z_audit_event` 的**定义副本**（否则只部署编排层就没这张表 ⇒
+「打了水印却没留痕」）。
+
+> ⚠ **两份定义必须一致**（以 z-audit 为权威源）——
+> 对账脚本 `.workbuddy/check-audit-ddl-sync.py`（CI 判红）。
+>
+> ⚠ **分进程部署时编排层不得直写该表** ⇒ 走 HTTP 交给 z-audit 写。
+> 部署三模式见 **#23**。
+
 ## 🎯 内置场景策略（5 个）
 
 | 场景码 | 流水线 | 水印 | 阈值 | 意图 |
@@ -226,11 +283,11 @@ z-biz-security/
 
 ```bash
 export JAVA_HOME=/Users/zifang/Library/Java/JavaVirtualMachines/corretto-17.0.19/Contents/Home
-mvn -f z-biz-security-core/pom.xml test    # 52 例
-mvn -f z-biz-security-web/pom.xml test     # 18 例（H2 + 真 HTTP）
+mvn -f z-biz-security-core/pom.xml test    # 70 例
+mvn -f z-biz-security-web/pom.xml test     # 23 例（H2 + 真 HTTP）
 ```
 
-**core 52 例**（21 + 5 + 26）：识别+脱敏、普通文本零改动、null 安全、禁用策略透传、
+**core 70 例**（21 + 5 + 26 + 9 + 9）：识别+脱敏、普通文本零改动、null 安全、禁用策略透传、
 拦截（≥ 阈值）、**阈值区分 L3/L4**、null 阈值永不拦、拦截不外泄原文、
 水印阶段生效/不生效、先脱敏后水印、审计留痕/不审计、拦截也留痕（DENIED）、
 策略注册表（按场景 / 兜底）、内置 5 场景、查看场景不拦、阶段解析、默认阶段顺序、结果视图；
@@ -240,16 +297,24 @@ mvn -f z-biz-security-web/pom.xml test     # 18 例（H2 + 真 HTTP）
 **「策略台账」26 例**：发布建版、操作人/原因必填、一场景一版、版本号只增、
 按场景解析、阶段非法 ⇒ 整条不可用、回滚建新版、回滚留痕、停用、
 原子替换、阶段编解码、**台账读空不清空注册表**、播种、不重复播种、**重启策略不丢**、
-读回副本、PUBLISHED 不可删。
+读回副本、PUBLISHED 不可删；
+**「溯源闭环」9 例**（`SecurityPipelineTraceIdTest`）：追踪码自动补 + 回写载荷、
+**结果/载荷/审计事件/台账四处完全一致**、调用方给码则全链路用它、
+**水印里提取的码能反查到审计记录**、WM 与 SEC 不撞行、同 traceId 跑两次只留一条、
+审计事件带租户/单号/操作人、台账炸了 ⇒ `traceError` 非空但水印仍生效、
+无水印阶段 ⇒ 不产生溯源记录；
+**「溯源台账适配器」9 例**（`LocalAuditTraceAdapterTest`）：**WM 行真落台账**、
+幂等、空码拒写、反查命中、查不到返 null、**查不了抛异常**、
+优先取 WM 行、**出口抛异常仍如实报 false**、事件按时间正序。
 
-**web 18 例**（8 + 10）：查看场景只脱敏、导出场景脱敏+水印、导出场景 L3 ⇒ **403**、
+**web 23 例**（8 + 10 + 5）：查看场景只脱敏、导出场景脱敏+水印、导出场景 L3 ⇒ **403**、
 导出场景 L4 ⇒ 403、未登记场景走兜底、策略查询端点、场景列表端点、健康检查可路由；
 **「策略台账」10 例**：发布落库 + 热改生效、**操作人为空 400 且不落库**、
 **变更原因为空 400**、一场景一版、**回滚建新版且历史不丢**、台账全量查询（含原因/操作人）、
-停用、DDL 幂等、**重启后策略不丢**、**台账为空 ⇒ 播种内置 5 场景**。
-
-**web 8 例**：查看场景只脱敏、导出场景脱敏+水印、导出场景 L3 ⇒ **403**、
-导出场景 L4 ⇒ 403、未登记场景走兜底、策略查询端点、场景列表端点、健康检查可路由。
+停用、DDL 幂等、**重启后策略不丢**、**台账为空 ⇒ 播种内置 5 场景**；
+**「溯源闭环 E2E」5 例**（`SecurityTraceClosureE2ETest`，真落库）：
+**两条行都在**（WM + SEC）、水印行带单号/操作人/租户、**无溯源缺口**（`traceError` 为空）、
+反查 200 + `trace` 单条视图、查不到 ⇒ **404**。
 
 ## 📌 踩坑留档
 
@@ -264,6 +329,11 @@ mvn -f z-biz-security-web/pom.xml test     # 18 例（H2 + 真 HTTP）
 | **★★ 台账读空 ⇒ 注册表被清空** | 启动装载时台账表不存在 ⇒ 拿到空列表 ⇒ `replaceAll(空)` ⇒ **内置 5 场景全没** ⇒ 全部降级 DEFAULT（阈值 L4）⇒ L3 身份证/手机号直接出域 | **装载不出任何生效策略时就不碰注册表**；web 层热改同样加这个守卫 |
 | **原子替换被中途态打断** | 热改若「先清空再逐条加」⇒ 并发窗口内看到空注册表 ⇒ 阈值掉到 L4 ⇒ 敏感数据出域 | `replaceAll` 先构造新表再一次性换引用 |
 | **`InitializingBean` 里读台账** | 上下文未就绪 ⇒ Mapper / DataSource 可能没起来 ⇒ 读台账必失败 | 改用 `ApplicationReadyEvent` |
+| **★★ 追踪码两处各自生成** | 流水线 `UUID.randomUUID()` + 水印用调用方 traceId ⇒ **两个值** ⇒ 反查永远查不到，而**功能上看不出来**（打水印成功、审计也成功） | **追踪码在任何阶段开始前定下来**（`resolveTraceId`），四处用同一个值 |
+| **★★ 编排层审计只算链不落库** | `new AuditService()` 无 Sink ⇒ 编排层的安全事件**一条都没进台账** ⇒ 「打了水印却没留痕」 | 挂 `PersistentAuditStore` 落库；并把 `z_audit_event` 加进本域 `init.sql`（否则只部署本域就缺表） |
+| **编排层漏挂水印溯源出口** | `embedTraced` 每次标「未配置溯源台账出口」⇒ WM 行**永远缺位** | `LocalAuditTraceAdapter` 把 `WatermarkTrace` 转 `AuditEvent` 交给**同一个** `AuditService`（共享链尾 ⇒ 链不分叉） |
+| **幂等命中被误报成「落库失败」** | 出口 `accept()` 返回 false 时不告诉你是「已在库里」还是「写失败」 ⇒ 重复提交会误报合规缺口 | 回查台账判「是否已在」；已在 ⇒ 算成功（**留痕在**），不在 ⇒ 如实报缺口 |
+| **`z_audit_event` DDL 两份会漂移** | 本域 `init.sql` 带了表定义副本 ⇒ 改了 z-audit 那边不同步 ⇒ 一边能跑一边炸，**且不会有测试变红** | 对账脚本 `.workbuddy/check-audit-ddl-sync.py`（CI 判红） |
 
 ## 文档目录
 
