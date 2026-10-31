@@ -32,14 +32,19 @@ z-biz-security/
 │   │              PolicyLedgerService（台账：发布/回滚/停用/装载）· PersistentPolicyStore
 │   ├── mapper/    SecurityPolicyMapper
 │   └── support/   BuiltinSecurityPolicies（5 个内置场景）· InMemoryPolicyStore
-└── z-biz-security-web/
-    ├── config/    BizSecurityAutoConfiguration · BizSecurityModuleDataSource · PolicyBootstrap · Health
+├── z-biz-security-starter/       编排引擎装配（仅此一处）+ 本域数据源（自足带走，3 例）
+│   └── config/    BizSecurityStarterAutoConfiguration · BizSecurityModuleDataSource（双包 @MapperScan）
+│                  · PolicyBootstrap（启动装载）
+└── z-biz-security-web/           管控面部署：依赖 starter，只管 REST + 健康检查（23 例）
+    ├── config/    BizSecurityAutoConfiguration（健康检查）· BizSecurityHealthIndicator
     └── api/       SecurityPipelineController · SecurityPolicyAdminController · BizSecurityHealthController
 ```
 
 三条结构约束：
 
-1. **只依赖四个仓的 `-core`**，不把 web / starter 拖进本 JVM —— 编排层与引擎同进程，无 RPC 依赖；
+1. **只依赖四个仓的 `-core`**（starter 也是），不把任何仓的 web / starter 拖进本 JVM ——
+   编排层与引擎同进程，无 RPC 依赖；本域数据源的双包 `@MapperScan` 要把 z-audit Mapper
+   绑到本域 sqlSessionFactory（同库同表单写者口径），依赖 z-audit-starter 会引发双扫描冲突；
 2. **注册表是运行期唯一判定入口**，台账是**持久化唯一权威源**，两者靠 `replaceAll` 原子衔接；
 3. 本仓是 **L1 业务编排仓**：`groupId=com.zifang`、`maven.deploy.skip=true`，**不发 Central**（同 z-biz）。
 

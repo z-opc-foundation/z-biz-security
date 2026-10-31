@@ -18,7 +18,7 @@
 | 依赖 | `z-sense-core` · `z-mask-core` · `z-watermark-core` · `z-audit-core`（**只依赖 core，不拖 web / starter 进本 JVM**） |
 | 端口 | 8098 |
 | 发布 | **不发 Maven Central**（`maven.deploy.skip=true`，同 z-biz） |
-| 模块 | `z-biz-security-core` · `z-biz-security-web` |
+| 模块 | `z-biz-security-core` · `z-biz-security-starter` · `z-biz-security-web` |
 
 ## 🎯 能力清单
 
@@ -270,21 +270,34 @@ z-biz-security/
 │       ├── service/   SecurityPipeline（编排）· SecurityPolicyRegistry
 │       │              PolicyLedgerService（台账）· PersistentPolicyStore
 │       └── support/   BuiltinSecurityPolicies（5 个内置场景）· InMemoryPolicyStore
-└── z-biz-security-web/
-    └── src/main/java/com/zifang/z/biz/security/web/
-        ├── config/    BizSecurityAutoConfiguration · BizSecurityModuleDataSource
-        │              BizSecurityHealthIndicator · PolicyBootstrap（启动装载）
-        └── api/       SecurityPipelineController · SecurityPolicyAdminController
-                       BizSecurityHealthController · ZBizSecurityWebApplication
+├── z-biz-security-starter/
+│   └── src/main/java/com/zifang/z/biz/security/starter/config/
+│       ├── BizSecurityStarterAutoConfiguration   编排引擎装配（仅此一处）+ @Import 本域数据源
+│       ├── BizSecurityModuleDataSource           本域数据源（双包 @MapperScan，与引擎同生共死）
+│       └── PolicyBootstrap                       策略启动装载（台账为空 ⇒ 播种内置）
+├── z-biz-security-web/
+│   └── src/main/java/com/zifang/z/biz/security/web/
+│       ├── config/    BizSecurityAutoConfiguration（只管部署关切：健康检查，依赖 starter）
+│       │              BizSecurityHealthIndicator
+│       └── api/       SecurityPipelineController · SecurityPolicyAdminController
+│                      BizSecurityHealthController · ZBizSecurityWebApplication
 └── _doc/002_deploy/init.sql    # 1 张表（幂等）
 ```
+
+> **编排引擎装配只有一处**：本仓 starter **自足带走本域数据源**
+> （引擎侧存储要构造器注入 Mapper，Mapper 没有 sqlSessionFactory 就是空的
+> ⇒ 数据源必须与引擎装配同生共死）。**starter 直接依赖四个能力仓的 `-core` 而非它们的
+> starter** —— 本域数据源的双包 `@MapperScan` 要把 z-audit Mapper 绑到本域
+> sqlSessionFactory（同库同表单写者口径），依赖 z-audit-starter 会引发同一个 Mapper 包
+> 被两个数据源二次 `@MapperScan` 的冲突。
 
 ## 🧪 测试
 
 ```bash
 export JAVA_HOME=/Users/zifang/Library/Java/JavaVirtualMachines/corretto-17.0.19/Contents/Home
-mvn -f z-biz-security-core/pom.xml test    # 70 例
-mvn -f z-biz-security-web/pom.xml test     # 23 例（H2 + 真 HTTP）
+mvn -f z-biz-security-core/pom.xml test       # 70 例
+mvn -f z-biz-security-starter/pom.xml test    # 3 例（H2 真落库）
+mvn -f z-biz-security-web/pom.xml test        # 23 例（H2 + 真 HTTP）
 ```
 
 **core 70 例**（21 + 5 + 26 + 9 + 9）：识别+脱敏、普通文本零改动、null 安全、禁用策略透传、
@@ -316,6 +329,12 @@ mvn -f z-biz-security-web/pom.xml test     # 23 例（H2 + 真 HTTP）
 **两条行都在**（WM + SEC）、水印行带单号/操作人/租户、**无溯源缺口**（`traceError` 为空）、
 反查 200 + `trace` 单条视图、查不到 ⇒ **404**。
 
+**starter 3 例**（嵌入式装配，宿主模拟应用放 `com.example.embedhost` 无关包树 ⇒ 组件扫描不可能兜底）：
+纯宿主只靠 `AutoConfiguration.imports` 装出**编排引擎全家 + 本域数据源**（流水线/台账/装载器/审计/数据源齐备）、
+**嵌入的流水线真跑**（查看场景 L3 身份证被遮蔽）+ **编排层直写台账可反查**（带链哈希）、
+**imports 完整性逐行 `Class.forName` 纯机械校验**（实测：正向用例抓不住包名笔误——
+Spring 侧有容错；本仓 web 的 imports 曾有真实斜杠笔误且管控面测试全绿，此护栏钉住后必判红）。
+
 ## 📌 踩坑留档
 
 | 坑 | 现象 | 修法 |
@@ -323,6 +342,7 @@ mvn -f z-biz-security-web/pom.xml test     # 23 例（H2 + 真 HTTP）
 | **测试数据校验位不对** | 身份证 `11010119900307123X` 校验位不过 ⇒ 引擎不命中 ⇒ 用例假红 | 换成 z-sense 里已验证的 `110101199003078515` |
 | **分级假设错** | 以为身份证是 L4，实际引擎口径是 **L3**（银行卡/凭据才是 L4） | 改测试阈值并**同步改内置策略**（导出场景改 L3 起拦） |
 | **骨架生成器包名笔误** | `com.zifang.z.biz/security.web.api`（斜杠混进包名）⇒ 编译期 `';' expected` | 全五仓扫 `com\.zifang\.z\.[a-z-]+/` 批量修 |
+| **★★ imports 文件斜杠笔误（编译期看不见）** | web 的 `AutoConfiguration.imports` 里是 `com.zifang.z.biz/security.web.config...` —— 编译器不管资源文件 ⇒ 编译过；管控面测试走**同包组件扫描兜底** ⇒ **一个测试都没让它变红** | 改成点号；starter 的宿主模拟放无关包树（扫描兜不了底）+ **imports 完整性测试逐行 `Class.forName`**（纯机械校验，变异验证过：常态绿 / 斜杠变异红） |
 | **测试断言写歪** | 期望 `status=PASS` 但实际 `MASKED`（有脱敏就是 MASKED）；导出场景用身份证 ⇒ 被 L3 阈值拦 ⇒ 403 | 改期望值；改用 L2 地址验证「脱敏+水印」两件事同时生效 |
 | **`SensitiveDetector` 不是函数式接口** | 有 `detect` + `name` 两个方法 ⇒ 不能用 lambda 构造「坏识别器」 | 写匿名内部类实现两个方法 |
 | **重叠消解口径与 z-sense 不一致** | z-sense 是「级别高者**替换**旧命中」，自己实现成「先占位者一律留」⇒ 上游已消解的命中被再消一次可能消出不同结果 ⇒ 错位遮蔽 | 与 `SenseResult#addHit` **逐条比对同算法**，并写单测钉住 |

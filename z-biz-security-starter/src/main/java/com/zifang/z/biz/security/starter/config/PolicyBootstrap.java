@@ -1,4 +1,4 @@
-package com.zifang.z.biz.security.web.config;
+package com.zifang.z.biz.security.starter.config;
 
 import com.zifang.z.biz.security.core.service.PolicyLedgerService;
 import com.zifang.z.biz.security.core.service.SecurityPolicyRegistry;

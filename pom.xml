@@ -57,6 +57,7 @@
 
     <modules>
         <module>z-biz-security-core</module>
+        <module>z-biz-security-starter</module>
         <module>z-biz-security-web</module>
     </modules>
 
@@ -95,6 +96,11 @@
             <dependency>
                 <groupId>com.zifang</groupId>
                 <artifactId>z-biz-security-core</artifactId>
+                <version>${revision}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.zifang</groupId>
+                <artifactId>z-biz-security-starter</artifactId>
                 <version>${revision}</version>
             </dependency>
             <dependency>
