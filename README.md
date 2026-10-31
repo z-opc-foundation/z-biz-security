@@ -264,3 +264,14 @@ mvn -f z-biz-security-web/pom.xml test     # 18 例（H2 + 真 HTTP）
 | **★★ 台账读空 ⇒ 注册表被清空** | 启动装载时台账表不存在 ⇒ 拿到空列表 ⇒ `replaceAll(空)` ⇒ **内置 5 场景全没** ⇒ 全部降级 DEFAULT（阈值 L4）⇒ L3 身份证/手机号直接出域 | **装载不出任何生效策略时就不碰注册表**；web 层热改同样加这个守卫 |
 | **原子替换被中途态打断** | 热改若「先清空再逐条加」⇒ 并发窗口内看到空注册表 ⇒ 阈值掉到 L4 ⇒ 敏感数据出域 | `replaceAll` 先构造新表再一次性换引用 |
 | **`InitializingBean` 里读台账** | 上下文未就绪 ⇒ Mapper / DataSource 可能没起来 ⇒ 读台账必失败 | 改用 `ApplicationReadyEvent` |
+
+## 文档目录
+
+本项目文档统一收口在 `_doc/` 下（lead 002 规范八类固定编号表，桶按需存在）:
+
+- [`_doc/001_arch/`](_doc/001_arch/) — 架构与不变式：
+  - [`00-overview.md`](_doc/001_arch/00-overview.md) — 总体设计（四段流水线、只依赖四仓 core、注册表/台账双权威源、十二条不变式含「台账读不出绝不清空注册表」、已知边界）。
+- [`_doc/002_deploy/`](_doc/002_deploy/) — 部署资产与初始化 SQL：
+  - [`init.sql`](_doc/002_deploy/init.sql) — 策略台账表 `z_biz_security_policy`（幂等）。
+- [`_doc/005_testing/`](_doc/005_testing/) — 验收复跑：
+  - [`001_验收复跑.md`](_doc/005_testing/001_验收复跑.md) — 五仓复跑命令、实测读数、已知边界与生产执行清单。
