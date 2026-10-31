@@ -1,6 +1,9 @@
 package com.zifang.z.biz.security.web.config;
 
 import com.zifang.z.audit.core.service.AuditService;
+import com.zifang.z.biz.security.core.mapper.SecurityPolicyMapper;
+import com.zifang.z.biz.security.core.service.PersistentPolicyStore;
+import com.zifang.z.biz.security.core.service.PolicyLedgerService;
 import com.zifang.z.biz.security.core.service.SecurityPipeline;
 import com.zifang.z.biz.security.core.service.SecurityPolicyRegistry;
 import com.zifang.z.biz.security.core.support.BuiltinSecurityPolicies;
@@ -98,6 +101,53 @@ public class BizSecurityAutoConfiguration {
             registry.register(policy);
         }
         return registry;
+    }
+
+    /**
+     * 策略台账存储（**落库版**）。
+     *
+     * <p>⚠️ 直接注入 {@code SecurityPolicyMapper}（不用 {@code @ConditionalOnBean}）——
+     * 后者评估时机早于 {@code @MapperScan} 注册 ⇒ 条件恒不成立 ⇒ 服务静默缺失。
+     *
+     * @param mapper 策略 Mapper
+     * @return 台账存储
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public PersistentPolicyStore persistentPolicyStore(SecurityPolicyMapper mapper) {
+        return new PersistentPolicyStore(mapper);
+    }
+
+    /**
+     * 策略台账服务（**发布 / 回滚 / 停用 / 热改**）。
+     *
+     * @param store 台账存储
+     * @return 台账服务
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public PolicyLedgerService policyLedgerService(PersistentPolicyStore store) {
+        return new PolicyLedgerService(store);
+    }
+
+    /**
+     * ★ 启动装载：从台账读生效策略（**台账为空 ⇒ 播种内置策略**）。
+     *
+     * <p>做这件事的原因是：**不装载的话，台账里改的策略重启就没了**
+     * ⇒ 热改只活到下次重启 ⇒ 等于「改了白改」。
+     *
+     * <p><b>⚠️ 装载失败不阻断启动</b>：台账读不出来（表没建 / 库连不上）
+     * ⇒ 保留内置策略继续跑 ⇒ 安全防护不能因为台账故障就整个瘫掉。
+     *
+     * @param registry 策略注册表
+     * @param ledger   策略台账服务
+     * @return 装载器（启动后执行一次）
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public PolicyBootstrap policyBootstrap(SecurityPolicyRegistry registry,
+                                           PolicyLedgerService ledger) {
+        return new PolicyBootstrap(registry, ledger);
     }
 
     /**

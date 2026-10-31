@@ -32,7 +32,10 @@
 | **拦截判定**（命中级别 ≥ 阈值 ⇒ 拦，不出域） | ✅ | `service/SecurityPipeline#shouldBlock` |
 | 流水线结果模型 | ✅ | `domain/SecurityResult` |
 | REST 端点（跑流水线 / 查策略 / 列场景） | ✅ | `web/api/SecurityPipelineController` |
-| 策略台账化（DB + 热改 + 审批） | ❌ M2 | 当前策略在代码里 |
+| 策略台账化（DB + 热改 + 审批） | ✅ M2 | `service/PolicyLedgerService` · `spi/PolicyStore` · `mapper/SecurityPolicyMapper` |
+| 策略版本状态机（DRAFT/PUBLISHED/SUPERSEDED/DISABLED） | ✅ M2 | `domain/PolicyStatus` |
+| 策略回滚（**以新版本号重发老内容**） | ✅ M2 | `service/PolicyLedgerService#rollback` |
+| 启动装载（台账为唯一权威源 + 首次播种） | ✅ M2 | `service/PolicyLedgerService#bootstrap` · `web/config/PolicyBootstrap` |
 | **识别一次脱敏一次**（按命中列表脱敏的重载） | ✅ M2 | MASK 阶段复用 SENSE 的命中列表（`maskService.mask(text, sense)`） |
 | 域内 DDL | — | M1 编排层**无自有表**（策略台账化时才需要） |
 
@@ -90,6 +93,52 @@
 > ⚠ **识别失败 ⇒ 不拦**是个已知风险：识别引擎挂了等于防护失效。
 > 生产上应配「识别不可用 ⇒ fail-close（拒绝出域）」的开关。**M1 未做，记在这里。**
 
+### ★ 策略台账化：改策略不用发版（M2 落地）
+
+M1 的策略写死在代码里 ⇒ 改阈值要发版、无历史、无回滚。本轮把策略变成**台账**。
+
+```
+z_biz_security_policy（表）
+  ├─ policy_id + scene + revision（版本号，只增不减）
+  ├─ status：DRAFT / PUBLISHED / SUPERSEDED / DISABLED
+  ├─ stages / watermark_type / block_threshold / mask_policy_set_id / enabled
+  └─ change_reason + operator_id + created_at（★ 合规三件套）
+```
+
+**四条硬口径**：
+
+| 口径 | 为什么 |
+|---|---|
+| **操作人与变更原因必填** | 没有这两个字段，台账答不出「谁改的、为什么改」⇒ 内审必挂。**服务端直接拒绝**，不靠调用方自觉 |
+| **发布 = 新版本**，不是 UPDATE 覆盖 | 覆盖就丢历史 ⇒ 「上次是谁把 L4 改成 L3 的」答不上来 |
+| **一场景一版生效** | 发布新版前先把旧的降为 SUPERSEDED ⇒「当前生效的是哪一版」永远唯一 |
+| **回滚 = 以新版本号重新发布老内容** | 版本号**不倒流** ⇒ 台账是一条只增不减的时间线，历史一条不丢 |
+
+**热改的原子性**：注册表用 `replaceAll` **一次性换引用**。
+若「先清空、再逐条加」，中间窗口内并发请求会看到**空注册表** ⇒ 全部走兜底
+⇒ 拦截阈值掉到 L4 ⇒ **本该拦的敏感数据没拦，直接出域**。这个坑只在生产高并发时偶发，
+本地压测看不出来 ⇒ 必须原子替换。
+
+#### ★★ 台账读不出时绝不清空注册表
+
+这是本轮踩到的**真 bug**（被 web 层测试抓出来）：台账表不存在 / 库连不上时，
+`bootstrap` 拿到空列表 ⇒ 若照样 `replaceAll` ⇒ **内置策略被清空** ⇒ 全部场景降级到
+DEFAULT 兜底（阈值 L4）⇒ **身份证 / 手机号这类 L3 数据直接出域**。
+
+修法：**装载不出任何生效策略时就不碰注册表**（保留内置策略继续跑）。
+宁可不装载，也不装载成空。
+
+**降级方向的口径**：台账故障 ⇒ 降级到**内置策略**（仍有一层防护），
+而不是启动失败（完全没防护）。
+
+#### 启动装载：台账是唯一权威源
+
+`ApplicationReadyEvent` 时从台账读生效策略 ⇒ **热改活过重启**。
+台账为空 ⇒ 播种内置策略（rev1 / PUBLISHED / operator=system）⇒ 首次初始化也有台账。
+
+> ⚠ 用 `ApplicationReadyEvent` 而不是 `InitializingBean`：后者在所有 bean 创建完之前跑
+> ⇒ 此时 Mapper / DataSource 可能还没就绪 ⇒ 读台账必然失败。
+
 ### ★ 编排层只识别一次（M2 落地）
 
 SENSE 阶段跑一次识别拿到分级做**拦截判定**，MASK 阶段把**同一份命中列表**交给
@@ -131,6 +180,12 @@ MaskResult masked = (sense != null)
 | POST | `/z-team/api/biz/security/process` | 跑一条流水线（按场景码） |
 | GET | `/z-team/api/biz/security/policies?scene=...` | 查某场景的策略 |
 | GET | `/z-team/api/biz/security/scenes` | 列全部已登记场景 |
+| **POST** | `/z-team/api/biz/security/policy/publish` | **发布一版策略**（新版本 + 取代旧版 + 热改生效） |
+| **POST** | `/z-team/api/biz/security/policy/rollback` | **回滚到历史版本**（以新版本号重发老内容） |
+| **POST** | `/z-team/api/biz/security/policy/disable` | **停用某场景**（该场景走兜底） |
+| **GET** | `/z-team/api/biz/security/policy/ledger` | **台账全量查询**（所有场景的所有版本） |
+| **GET** | `/z-team/api/biz/security/policy/published` | 当前生效策略视图 |
+| **POST** | `/z-team/api/biz/security/policy/refresh` | 手动热改刷新（改了库没发版时兜一把） |
 | GET | `/api/biz/security/health` | 健康检查（**无 /z-team 前缀**） |
 
 **业务方怎么用**：只报场景码 + 内容，不自己拼脱敏策略。
@@ -152,29 +207,46 @@ z-biz-security/
 ├── z-biz-security-core/
 │   └── src/main/java/com/zifang/z/biz/security/core/
 │       ├── domain/    SecurityPolicy · SecurityStage · SecurityResult
+│       │              PolicyStatus · PolicyRevision · PolicyRevisionRecord
+│       ├── spi/       PolicyStore
+│       ├── mapper/    SecurityPolicyMapper
 │       ├── service/   SecurityPipeline（编排）· SecurityPolicyRegistry
-│       └── support/   BuiltinSecurityPolicies（5 个内置场景）
+│       │              PolicyLedgerService（台账）· PersistentPolicyStore
+│       └── support/   BuiltinSecurityPolicies（5 个内置场景）· InMemoryPolicyStore
 └── z-biz-security-web/
     └── src/main/java/com/zifang/z/biz/security/web/
-        ├── config/    BizSecurityAutoConfiguration · BizSecurityModuleDataSource · BizSecurityHealthIndicator
-        └── api/       SecurityPipelineController · BizSecurityHealthController · ZBizSecurityWebApplication
+        ├── config/    BizSecurityAutoConfiguration · BizSecurityModuleDataSource
+        │              BizSecurityHealthIndicator · PolicyBootstrap（启动装载）
+        └── api/       SecurityPipelineController · SecurityPolicyAdminController
+                       BizSecurityHealthController · ZBizSecurityWebApplication
+└── _doc/002_deploy/init.sql    # 1 张表（幂等）
 ```
 
 ## 🧪 测试
 
 ```bash
 export JAVA_HOME=/Users/zifang/Library/Java/JavaVirtualMachines/corretto-17.0.19/Contents/Home
-mvn -f z-biz-security-core/pom.xml test    # 26 例
-mvn -f z-biz-security-web/pom.xml test     # 8 例（H2 + 真 HTTP）
+mvn -f z-biz-security-core/pom.xml test    # 52 例
+mvn -f z-biz-security-web/pom.xml test     # 18 例（H2 + 真 HTTP）
 ```
 
-**core 26 例**（21 + 5）：识别+脱敏、普通文本零改动、null 安全、禁用策略透传、
+**core 52 例**（21 + 5 + 26）：识别+脱敏、普通文本零改动、null 安全、禁用策略透传、
 拦截（≥ 阈值）、**阈值区分 L3/L4**、null 阈值永不拦、拦截不外泄原文、
 水印阶段生效/不生效、先脱敏后水印、审计留痕/不审计、拦截也留痕（DENIED）、
 策略注册表（按场景 / 兜底）、内置 5 场景、查看场景不拦、阶段解析、默认阶段顺序、结果视图；
 **「只识别一次」5 例**：全文只识别一次（计数验）、只跑 SENSE 也只一次、
 只跑 MASK ⇒ 退回自识别一次（不是零次）、**规则中途变化 ⇒ 拦截与脱敏仍同源**、
-拦截时命中数一致。
+拦截时命中数一致；
+**「策略台账」26 例**：发布建版、操作人/原因必填、一场景一版、版本号只增、
+按场景解析、阶段非法 ⇒ 整条不可用、回滚建新版、回滚留痕、停用、
+原子替换、阶段编解码、**台账读空不清空注册表**、播种、不重复播种、**重启策略不丢**、
+读回副本、PUBLISHED 不可删。
+
+**web 18 例**（8 + 10）：查看场景只脱敏、导出场景脱敏+水印、导出场景 L3 ⇒ **403**、
+导出场景 L4 ⇒ 403、未登记场景走兜底、策略查询端点、场景列表端点、健康检查可路由；
+**「策略台账」10 例**：发布落库 + 热改生效、**操作人为空 400 且不落库**、
+**变更原因为空 400**、一场景一版、**回滚建新版且历史不丢**、台账全量查询（含原因/操作人）、
+停用、DDL 幂等、**重启后策略不丢**、**台账为空 ⇒ 播种内置 5 场景**。
 
 **web 8 例**：查看场景只脱敏、导出场景脱敏+水印、导出场景 L3 ⇒ **403**、
 导出场景 L4 ⇒ 403、未登记场景走兜底、策略查询端点、场景列表端点、健康检查可路由。
@@ -189,3 +261,6 @@ mvn -f z-biz-security-web/pom.xml test     # 8 例（H2 + 真 HTTP）
 | **测试断言写歪** | 期望 `status=PASS` 但实际 `MASKED`（有脱敏就是 MASKED）；导出场景用身份证 ⇒ 被 L3 阈值拦 ⇒ 403 | 改期望值；改用 L2 地址验证「脱敏+水印」两件事同时生效 |
 | **`SensitiveDetector` 不是函数式接口** | 有 `detect` + `name` 两个方法 ⇒ 不能用 lambda 构造「坏识别器」 | 写匿名内部类实现两个方法 |
 | **重叠消解口径与 z-sense 不一致** | z-sense 是「级别高者**替换**旧命中」，自己实现成「先占位者一律留」⇒ 上游已消解的命中被再消一次可能消出不同结果 ⇒ 错位遮蔽 | 与 `SenseResult#addHit` **逐条比对同算法**，并写单测钉住 |
+| **★★ 台账读空 ⇒ 注册表被清空** | 启动装载时台账表不存在 ⇒ 拿到空列表 ⇒ `replaceAll(空)` ⇒ **内置 5 场景全没** ⇒ 全部降级 DEFAULT（阈值 L4）⇒ L3 身份证/手机号直接出域 | **装载不出任何生效策略时就不碰注册表**；web 层热改同样加这个守卫 |
+| **原子替换被中途态打断** | 热改若「先清空再逐条加」⇒ 并发窗口内看到空注册表 ⇒ 阈值掉到 L4 ⇒ 敏感数据出域 | `replaceAll` 先构造新表再一次性换引用 |
+| **`InitializingBean` 里读台账** | 上下文未就绪 ⇒ Mapper / DataSource 可能没起来 ⇒ 读台账必失败 | 改用 `ApplicationReadyEvent` |

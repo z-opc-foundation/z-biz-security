@@ -106,4 +106,41 @@ public class SecurityPolicyRegistry {
     public List<SecurityPolicy> all() {
         return Collections.unmodifiableList(new ArrayList<>(byScene.values()));
     }
+
+    /**
+     * ★ 原子热替换全部场景策略（**策略台账热改的落地口**）。
+     *
+     * <p><b>为什么必须原子</b>：热改时若「先清空、再逐条加」，
+     * 中间窗口内并发请求会看到**空注册表** ⇒ 全部走兜底策略
+     * ⇒ 拦截阈值掉到 L4 ⇒ <b>本该拦的敏感数据没拦，直接出域</b>。
+     * 这是热改最容易出的事故，且**只在生产高并发时偶发**（本地压测看不出来）。
+     *
+     * <p>本方法先在本地构造新表，构造完再**一次性替换引用** ⇒
+     * 任何时刻并发读者看到的都是**完整的旧版或完整的新版**，不会看到中间态。
+     *
+     * @param policies 新的全量策略（可空 ⇒ 不变）
+     */
+    public synchronized void replaceAll(List<SecurityPolicy> policies) {
+        if (policies == null) {
+            return;
+        }
+        Map<String, SecurityPolicy> fresh = new LinkedHashMap<>();
+        for (SecurityPolicy p : policies) {
+            if (p == null || p.getScene() == null || p.getScene().isEmpty()) {
+                continue;
+            }
+            fresh.put(p.getScene(), p);
+        }
+        byScene.clear();
+        byScene.putAll(fresh);
+    }
+
+    /**
+     * 取一份**快照**（用于热改时读取当前全量再合并）。
+     *
+     * @return 场景 → 策略 的副本
+     */
+    public synchronized Map<String, SecurityPolicy> snapshot() {
+        return new LinkedHashMap<>(byScene);
+    }
 }
