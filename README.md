@@ -300,6 +300,10 @@ mvn -f z-biz-security-starter/pom.xml test    # 3 例（H2 真落库）
 mvn -f z-biz-security-web/pom.xml test        # 23 例（H2 + 真 HTTP）
 ```
 
+> **CI**：push / PR 自动跑 GitHub Actions（`.github/workflows/ci.yml`：JDK 17 + `mvn -B -ntp verify`）。
+> 因四引擎 core **未发 Central**，CI 先检出四个兄弟仓装 `*-core` 再构建本仓
+> —— 需在本仓 Secrets 配 `Z_OPC_FOUNDATION_TOKEN`（classic，scope=repo），没配则 CI 红（基础设施缺口）。
+
 **core 70 例**（21 + 5 + 26 + 9 + 9）：识别+脱敏、普通文本零改动、null 安全、禁用策略透传、
 拦截（≥ 阈值）、**阈值区分 L3/L4**、null 阈值永不拦、拦截不外泄原文、
 水印阶段生效/不生效、先脱敏后水印、审计留痕/不审计、拦截也留痕（DENIED）、
@@ -363,5 +367,6 @@ Spring 侧有容错；本仓 web 的 imports 曾有真实斜杠笔误且管控�
   - [`00-overview.md`](_doc/001_arch/00-overview.md) — 总体设计（四段流水线、只依赖四仓 core、注册表/台账双权威源、十二条不变式含「台账读不出绝不清空注册表」、已知边界）。
 - [`_doc/002_deploy/`](_doc/002_deploy/) — 部署资产与初始化 SQL：
   - [`init.sql`](_doc/002_deploy/init.sql) — 策略台账表 `z_biz_security_policy`（幂等）。
+  - [`deploy-modes.md`](_doc/002_deploy/deploy-modes.md) — 部署三模式（同进程直写 / 分进程 HTTP / 独立审计域：单写者归属、配置键、防链分叉禁配清单、代码现状与缺口）。
 - [`_doc/005_testing/`](_doc/005_testing/) — 验收复跑：
   - [`001_验收复跑.md`](_doc/005_testing/001_验收复跑.md) — 五仓复跑命令、实测读数、已知边界与生产执行清单。

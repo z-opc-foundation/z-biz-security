@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build & test (JDK 17)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 编排层依赖四个能力仓的 -core；四引擎本轮未发制品（Central 无坐标）
+      # ⇒ CI 必须先把四个兄弟仓装进本地仓库。私有仓跨仓检出需要组织读权限 PAT：
+      #   本仓 Secrets 配 Z_OPC_FOUNDATION_TOKEN（classic，scope=repo 只读即可）。
+      #   没配这个 secret 时本步骤会红 —— 那是基础设施缺口，不是代码问题。
+      - name: Checkout sibling engine repos
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.Z_OPC_FOUNDATION_TOKEN }}
+          path: .sibling/z-sense
+          repository: z-opc-foundation/z-sense
+
+      - name: Checkout z-mask
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.Z_OPC_FOUNDATION_TOKEN }}
+          path: .sibling/z-mask
+          repository: z-opc-foundation/z-mask
+
+      - name: Checkout z-watermark
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.Z_OPC_FOUNDATION_TOKEN }}
+          path: .sibling/z-watermark
+          repository: z-opc-foundation/z-watermark
+
+      - name: Checkout z-audit
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.Z_OPC_FOUNDATION_TOKEN }}
+          path: .sibling/z-audit
+          repository: z-opc-foundation/z-audit
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # 只装 core 模块（编排层的依赖面就这四个坐标）；-DskipTests 不跑兄弟仓测试 ——
+      # 四个仓各自的 CI 负责自己的测试，这里只解决坐标可得性。
+      - name: Install sibling engine cores
+        run: |
+          set -e
+          for repo in z-sense z-mask z-watermark z-audit; do
+            echo "==== install $repo-core ===="
+            mvn -B -ntp -f ".sibling/$repo/pom.xml" -pl "$repo-core" install -DskipTests
+          done
+
+      - name: Build and test
+        run: mvn -B -ntp verify
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: '**/target/surefire-reports/'
+          if-no-files-found: ignore
+          retention-days: 14
